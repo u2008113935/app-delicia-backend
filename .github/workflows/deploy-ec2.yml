@@ -2,8 +2,8 @@ name: Deploy SpringBoot to AWS EC2
 
 on:
   push:
-    branches: [ "main" ]     # despliega en cada push a main
-  workflow_dispatch:          # permite ejecutarlo manualmente
+    branches: [ "main" ]
+  workflow_dispatch:
 
 concurrency:
   group: deploy-ec2
@@ -12,20 +12,16 @@ concurrency:
 jobs:
   build-and-deploy:
     runs-on: ubuntu-latest
-
     steps:
-      # 1) Traer el código
       - name: Checkout
         uses: actions/checkout@v4
 
-      # 2) Java para compilar el JAR
       - name: Setup Java
         uses: actions/setup-java@v4
         with:
           distribution: temurin
-          java-version: '17'        # ajusta si usas 21
+          java-version: '17'
 
-      # 3) Cache de dependencias Maven (acelera builds)
       - name: Cache Maven
         uses: actions/cache@v4
         with:
@@ -34,27 +30,46 @@ jobs:
           restore-keys: |
             ${{ runner.os }}-maven-
 
-      # 4) Build del proyecto (JAR ejecutable)
       - name: Build Spring Boot (skip tests)
         run: mvn -B -DskipTests package
 
-      # 5) Cargar tu clave privada al agente SSH (usando tu secret)
       - name: Configure SSH agent
         uses: webfactory/ssh-agent@v0.9.0
         with:
           ssh-private-key: ${{ secrets.EC2_SSH_PRIVATE_KEY }}
 
-      # 6) Confiar en la huella del host para evitar prompt interactivo
       - name: Add EC2 host to known_hosts
         run: |
           mkdir -p ~/.ssh
           ssh-keyscan -H ${{ secrets.EC2_HOST }} >> ~/.ssh/known_hosts
 
-      # 7) Subir el JAR al servidor (deploy atómico usando carpeta _incoming)
+      # (Opcional) prueba rápida de conexión SSH
+      - name: Test SSH connection
+        run: ssh -o StrictHostKeyChecking=no ${{ secrets.EC2_USER }}@${{ secrets.EC2_HOST }} "echo 'SSH OK on $(hostname)'"
+
       - name: Upload JAR with rsync
         run: |
-            sudo apt-get update && sudo apt-get install -y rsync
-            JAR_FILE=$(ls -t target/*.jar | head -n 1)
-            echo "Uploading $JAR_FILE to EC2..."
-            ssh ${{ secrets.EC2_USER }}@${{ secrets.EC2_HOST }} "mkdir -p '${{ secrets.EC2_APP_DIR }}/_incoming'"
-            rsync -avz "$JAR_FILE" ${{ secrets.EC2_USER }}@${{ secrets.EC2_HOST }}:${{ secrets.EC2_APP_DIR }}/_incoming/
+          sudo apt-get update && sudo apt-get install -y rsync
+          JAR_FILE=$(ls -t target/*.jar | head -n 1)
+          echo "Uploading $JAR_FILE to EC2..."
+          ssh ${{ secrets.EC2_USER }}@${{ secrets.EC2_HOST }} "mkdir -p '${{ secrets.EC2_APP_DIR }}/_incoming'"
+          rsync -avz "$JAR_FILE" ${{ secrets.EC2_USER }}@${{ secrets.EC2_HOST }}:${{ secrets.EC2_APP_DIR }}/_incoming/
+
+      - name: Restart service on EC2
+        run: |
+          ssh ${{ secrets.EC2_USER }}@${{ secrets.EC2_HOST }} << 'EOF'
+            set -e
+            APP_DIR="${{ secrets.EC2_APP_DIR }}"
+            SERVICE="${{ secrets.EC2_SERVICE }}"
+            mkdir -p "$APP_DIR/_incoming"
+            NEW_JAR=$(ls -t "$APP_DIR/_incoming"/*.jar | head -n 1)
+            if [ ! -f "$NEW_JAR" ]; then
+              echo "No se encontró el JAR nuevo en _incoming"; exit 1
+            fi
+            sudo systemctl stop "$SERVICE" || true
+            mv "$NEW_JAR" "$APP_DIR/app.jar"
+            sudo systemctl daemon-reload
+            sudo systemctl start "$SERVICE"
+            sleep 3
+            sudo systemctl status "$SERVICE" --no-pager -l || true
+          EOF
