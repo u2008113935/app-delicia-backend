@@ -1,13 +1,9 @@
-name: Deploy SpringBoot to AWS EC2
+name: Deploy SpringBoot to AWS EC2 (minimal)
 
 on:
   push:
     branches: [ "main" ]
   workflow_dispatch:
-
-concurrency:
-  group: deploy-ec2
-  cancel-in-progress: true
 
 jobs:
   build-and-deploy:
@@ -22,54 +18,50 @@ jobs:
           distribution: temurin
           java-version: '17'
 
-      - name: Cache Maven
-        uses: actions/cache@v4
-        with:
-          path: ~/.m2/repository
-          key: ${{ runner.os }}-maven-${{ hashFiles('**/pom.xml') }}
-          restore-keys: |
-            ${{ runner.os }}-maven-
-
       - name: Build Spring Boot (skip tests)
-        run: mvn -B -DskipTests package
+        run: ./mvnw -B -DskipTests package
 
-      - name: Configure SSH agent
+      - name: Load SSH key
         uses: webfactory/ssh-agent@v0.9.0
         with:
           ssh-private-key: ${{ secrets.EC2_SSH_PRIVATE_KEY }}
 
-      - name: Add EC2 host to known_hosts
+      - name: Add host to known_hosts
         run: |
           mkdir -p ~/.ssh
           ssh-keyscan -H ${{ secrets.EC2_HOST }} >> ~/.ssh/known_hosts
 
-      # (Opcional) prueba rápida de conexión SSH
-      - name: Test SSH connection
-        run: ssh -o StrictHostKeyChecking=no ${{ secrets.EC2_USER }}@${{ secrets.EC2_HOST }} "echo 'SSH OK on $(hostname)'"
-
-      - name: Upload JAR with rsync
+      - name: Upload JAR (scp)
         run: |
-          sudo apt-get update && sudo apt-get install -y rsync
           JAR_FILE=$(ls -t target/*.jar | head -n 1)
-          echo "Uploading $JAR_FILE to EC2..."
-          ssh ${{ secrets.EC2_USER }}@${{ secrets.EC2_HOST }} "mkdir -p '${{ secrets.EC2_APP_DIR }}/_incoming'"
-          rsync -avz "$JAR_FILE" ${{ secrets.EC2_USER }}@${{ secrets.EC2_HOST }}:${{ secrets.EC2_APP_DIR }}/_incoming/
+          ssh ${{ secrets.EC2_USER }}@${{ secrets.EC2_HOST }} "mkdir -p ~/app-delicia/logs"
+          scp "$JAR_FILE" ${{ secrets.EC2_USER }}@${{ secrets.EC2_HOST }}:~/app-delicia/app.jar
 
-      - name: Restart service on EC2
+      - name: Restart app (nohup + PID file)
         run: |
           ssh ${{ secrets.EC2_USER }}@${{ secrets.EC2_HOST }} << 'EOF'
             set -e
-            APP_DIR="${{ secrets.EC2_APP_DIR }}"
-            SERVICE="${{ secrets.EC2_SERVICE }}"
-            mkdir -p "$APP_DIR/_incoming"
-            NEW_JAR=$(ls -t "$APP_DIR/_incoming"/*.jar | head -n 1)
-            if [ ! -f "$NEW_JAR" ]; then
-              echo "No se encontró el JAR nuevo en _incoming"; exit 1
+            cd ~/app-delicia
+
+            # Instalar Java si no existe (requiere sudo)
+            if ! command -v java >/dev/null 2>&1; then
+              sudo apt-get update && sudo apt-get install -y openjdk-17-jre
             fi
-            sudo systemctl stop "$SERVICE" || true
-            mv "$NEW_JAR" "$APP_DIR/app.jar"
-            sudo systemctl daemon-reload
-            sudo systemctl start "$SERVICE"
-            sleep 3
-            sudo systemctl status "$SERVICE" --no-pager -l || true
+
+            # Parar si está corriendo
+            if [ -f app.pid ] && kill -0 $(cat app.pid) 2>/dev/null; then
+              echo "Stopping previous process..."
+              kill $(cat app.pid) || true
+              sleep 2
+              if kill -0 $(cat app.pid) 2>/dev/null; then
+                echo "Force kill..."
+                kill -9 $(cat app.pid) || true
+              fi
+              rm -f app.pid
+            fi
+
+            # Arrancar en segundo plano con logs
+            nohup java -jar ./app.jar > ./logs/app.out 2>&1 &
+            echo $! > app.pid
+            echo "Started with PID $(cat app.pid)"
           EOF
