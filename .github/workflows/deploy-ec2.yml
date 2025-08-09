@@ -1,0 +1,58 @@
+name: Deploy SpringBoot to AWS EC2
+
+on:
+  push:
+    branches: [ "main" ]     # despliega en cada push a main
+  workflow_dispatch:          # permite ejecutarlo manualmente
+
+concurrency:
+  group: deploy-ec2
+  cancel-in-progress: true
+
+jobs:
+  build-and-deploy:
+    runs-on: ubuntu-latest
+
+    steps:
+      # 1) Traer el código
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      # 2) Java para compilar el JAR
+      - name: Setup Java
+        uses: actions/setup-java@v4
+        with:
+          distribution: temurin
+          java-version: '17'        # ajusta si usas 21
+
+      # 3) Cache de dependencias Maven (acelera builds)
+      - name: Cache Maven
+        uses: actions/cache@v4
+        with:
+          path: ~/.m2/repository
+          key: ${{ runner.os }}-maven-${{ hashFiles('**/pom.xml') }}
+          restore-keys: |
+            ${{ runner.os }}-maven-
+
+      # 4) Build del proyecto (JAR ejecutable)
+      - name: Build Spring Boot (skip tests)
+        run: mvn -B -DskipTests package
+
+      # 5) Cargar tu clave privada al agente SSH (usando tu secret)
+      - name: Configure SSH agent
+        uses: webfactory/ssh-agent@v0.9.0
+        with:
+          ssh-private-key: ${{ secrets.EC2_SSH_PRIVATE_KEY }}
+
+      # 6) Confiar en la huella del host para evitar prompt interactivo
+      - name: Add EC2 host to known_hosts
+        run: |
+          mkdir -p ~/.ssh
+          ssh-keyscan -H ${{ secrets.EC2_HOST }} >> ~/.ssh/known_hosts
+
+      # 7) Subir el JAR al servidor (deploy atómico usando carpeta _incoming)
+      - name: Upload JAR with rsync
+        run: |
+          JAR_FILE=$(ls -t target/*.jar | head -n 1)
+          echo "Uploading $JAR_FILE to EC2..."
+          ssh ${{ secrets.EC2_USER }}@${{ secrets.EC2_HOST }} "mkdir -p ${{ secrets.EC2_APP_DIR }}/_incomi_
